@@ -1,0 +1,473 @@
+---
+title: "rat_treatment"
+author: "Yue He"
+date: "2025-06-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r}
+# Set working directory to where CEL files are located
+setwd("~/data/rat_treatment")
+
+# Load required packages
+library(oligo)
+library(limma)
+library(ggplot2)
+library(pheatmap)
+#library(EnhancedVolcano)
+library(ragene20sttranscriptcluster.db)  # Annotation package
+library(dplyr)
+library(pd.ragene.2.0.st)
+library(org.Rn.eg.db)
+library(annotate)
+```
+
+```{r}
+# Strict BLAS configuration to prevent threading issues
+options(mc.cores = 1)
+Sys.setenv(OPENBLAS_NUM_THREADS="1")
+```
+
+```{r}
+### STEP 1: Read and normalize CEL files
+# ----------------------------------------------------------
+# List CEL files and read them
+cel_files <- list.celfiles(full.names = TRUE)
+sample_names <- tools::file_path_sans_ext(basename(cel_files))
+raw_data <- read.celfiles(cel_files)
+
+# Set clean sample names
+sampleNames(raw_data) <- sample_names
+```
+
+```{r}
+# Perform RMA normalization
+norm_data <- oligo::rma(raw_data, target = "core")
+norm_expr <- exprs(norm_data)
+```
+
+```{r}
+### STEP 2: Create explicit sample-group mapping and design matrix
+# ----------------------------------------------------------
+# Define sample-group mapping
+sample_group_map <- data.frame(
+    Sample = c("Rat12_R1", "Rat13_R1", "Rat14_R1", "Rat15_R1",   # Control group
+               "Rat1_R1", "Rat2_R1", "Rat5_R2", "Rat8_R2",       # Low group
+               "Rat5_R1", "Rat6_R1"),                            # High group
+    Group = c(rep("Control", 4), 
+              rep("Low", 4), 
+              rep("High", 2)),
+    stringsAsFactors = FALSE
+)
+
+# CRITICAL: Match groups to sample order in normalized data
+ordered_samples <- sampleNames(norm_data)
+groups <- factor(sample_group_map$Group[match(ordered_samples, sample_group_map$Sample)],
+                 levels = c("Control", "Low", "High"))
+
+# VERIFICATION: Print sample-group mapping
+message("VERIFIED SAMPLE-GROUP MAPPING:")
+print(data.frame(Sample = ordered_samples, Group = groups))
+```
+
+
+```{r}
+# Create design matrix
+design <- model.matrix(~ 0 + groups)
+colnames(design) <- c("Control", "Low", "High")
+rownames(design) <- ordered_samples
+
+# Print design matrix for verification
+message("\nDESIGN MATRIX:")
+print(design)
+```
+
+```{r}
+### STEP 3: Linear model fitting with enhanced options
+# ----------------------------------------------------------
+# Fit linear model
+fit <- lmFit(norm_expr, design)
+
+# Define contrasts of interest
+contrasts <- makeContrasts(
+    HighVsControl = High - Control,
+    LowVsControl = Low - Control,
+    HighVsLow = High - Low,
+    levels = design
+)
+
+message("\nCONTRAST MATRIX:")
+print(contrasts)
+
+# Apply contrasts and empirical Bayes moderation
+fit_contrasts <- contrasts.fit(fit, contrasts)
+fit_eb <- eBayes(fit_contrasts, 
+                 trend = TRUE,   # Account for mean-variance relationship
+                 robust = TRUE)  # Protect against outliers
+```
+
+
+```{r}
+### STEP 4: Extract differential expression results
+# ----------------------------------------------------------
+results <- list(
+    HighVsControl = topTable(fit_eb, coef = "HighVsControl", number = Inf, sort.by = "P"),
+    LowVsControl = topTable(fit_eb, coef = "LowVsControl", number = Inf, sort.by = "P"),
+    HighVsLow = topTable(fit_eb, coef = "HighVsLow", number = Inf, sort.by = "P")
+)
+
+# Add gene annotations
+library(AnnotationDbi)
+library(ragene20sttranscriptcluster.db)
+
+add_annotations <- function(df) {
+    # Preserve probe IDs as column instead of row names
+    df$PROBEID <- rownames(df)
+    
+    # Get gene symbols
+    symbols <- mapIds(ragene20sttranscriptcluster.db,
+                     keys = rownames(df),
+                     column = "SYMBOL",
+                     keytype = "PROBEID")
+    
+    # Get gene names
+    genenames <- mapIds(ragene20sttranscriptcluster.db,
+                        keys = rownames(df),
+                        column = "GENENAME",
+                        keytype = "PROBEID")
+    
+    # Add to dataframe
+    df$SYMBOL <- symbols
+    df$GENENAME <- genenames
+    
+    # Move probe ID to first column
+    df <- df[, c("PROBEID", setdiff(colnames(df), "PROBEID"))]
+    return(df)
+}
+
+results <- lapply(results, add_annotations)
+```
+
+```{r}
+### STEP 5: Save results and diagnostics
+# ----------------------------------------------------------
+# Save R objects
+saveRDS(results, "differential_expression_results.rds")
+
+# Write CSV files
+write.csv(results$HighVsControl, "/home/rstudio/data/rat_project_output/High_vs_Control_results.csv", row.names = FALSE)
+write.csv(results$LowVsControl, "/home/rstudio/data/rat_project_output/Low_vs_Control_results.csv", row.names = FALSE)
+write.csv(results$HighVsLow, "/home/rstudio/data/rat_project_output/High_vs_Low_results.csv", row.names = FALSE)
+
+# Diagnostic plot: Mean-variance trend
+png("mean_variance_trend.png")
+plotSA(fit_eb, main = "Mean-Variance Trend")
+dev.off()
+
+message("Analysis complete! Check verification outputs above.")
+```
+
+
+```{r}
+#PCA plot of all groups
+
+# Transpose expression matrix for PCA (samples as rows)
+pca_result <- prcomp(t(norm_expr), scale. = TRUE)
+
+# Build PCA data frame
+pca_df <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  Sample = colnames(norm_expr),
+  Group = groups
+)
+
+# Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = Sample)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  labs(
+    #title = "PCA of RNA-Normalized Expression",
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2, 1], 1), "% variance)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2, 2], 1), "% variance)")
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+
+# Save the PCA plot (optional)
+ggsave("pca_plot.pdf", width = 7, height = 5)
+
+```
+```{r}
+# pca plot of low vs control
+selected_groups <- c("Low", "Control")
+selected_samples <- sample_group_map$Sample[sample_group_map$Group %in% selected_groups]
+
+# Subset the expression matrix to selected samples
+norm_expr_sub <- norm_expr[, selected_samples]
+
+# Subset and align groups to the selected sample order
+groups_sub <- factor(sample_group_map$Group[match(selected_samples, sample_group_map$Sample)],
+                     levels = selected_groups)
+
+# Run PCA
+pca_result <- prcomp(t(norm_expr_sub), scale. = TRUE)
+
+# Build PCA data frame
+pca_df <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  Sample = colnames(norm_expr_sub),
+  Group = groups_sub
+)
+
+# Plot PCA
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = Sample)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  labs(
+    #title = "PCA of RNA-Normalized Expression (Low vs Control)",
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2, 1], 1), "% variance)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2, 2], 1), "% variance)")
+  ) +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+
+# Save the PCA plot
+ggsave("pca_plot_low_vs_control.pdf", width = 7, height = 5)
+
+```
+
+
+
+
+```{r}
+# volcano plot of high vs control
+library(ggplot2)
+library(ggrepel)
+
+volcano_df0 <- results$HighVsControl
+
+# Create a new column for coloring the points based on the criteria
+volcano_df0$Status <- "Not Significant"
+volcano_df0$Status[volcano_df0$adj.P.Val < 0.05 & volcano_df0$logFC > 1.5] <- "Upregulated"
+volcano_df0$Status[volcano_df0$adj.P.Val < 0.05 & volcano_df0$logFC < -1.5] <- "Downregulated"
+
+# Create labels for significant genes
+volcano_df0$Label <- ifelse(volcano_df0$adj.P.Val < 0.05 & abs(volcano_df0$logFC) > 1.5, 
+                          volcano_df0$SYMBOL, NA)
+
+ggplot(volcano_df0, aes(x = logFC, y = -log10(adj.P.Val), color = Status)) +
+  geom_point(alpha = 0.7) +
+  geom_label_repel(
+    aes(label = Label), 
+    max.overlaps = Inf, 
+    size = 3,
+    segment.size = 0.3,        # Add line thickness
+    segment.color = "grey50",  # Set line color
+    box.padding = 0.5,         # Add padding around text
+    point.padding = 0.3,       # Add padding around points
+    force = 5                  # Increase force of repulsion
+  ) +
+  scale_color_manual(values = c("Not Significant" = "grey", 
+                               "Upregulated" = "red", 
+                               "Downregulated" = "blue")) +
+  labs(#title = "Volcano Plot: Low vs Control",
+       x = "Log2 Fold Change", y = "-log10(P-value)") +
+  theme_minimal()
+
+ggsave("high_volcano_plot.tiff", width = 7, height = 5)
+
+```
+```{r}
+
+#volcano plot of low vs control
+library(ggplot2)
+library(ggrepel)
+
+volcano_df <- results$LowVsControl
+
+# Create a new column for coloring the points based on the criteria
+volcano_df$Status <- "Not Significant"
+volcano_df$Status[volcano_df$adj.P.Val < 0.05 & volcano_df$logFC > 1.5] <- "Upregulated"
+volcano_df$Status[volcano_df$adj.P.Val < 0.05 & volcano_df$logFC < -1.5] <- "Downregulated"
+
+# Create labels for significant genes
+volcano_df$Label <- ifelse(volcano_df$adj.P.Val < 0.05 & abs(volcano_df$logFC) > 1.5, 
+                          volcano_df$SYMBOL, NA)
+
+ggplot(volcano_df, aes(x = logFC, y = -log10(adj.P.Val), color = Status)) +
+  geom_point(alpha = 0.7) +
+  geom_label_repel(
+    aes(label = Label), 
+    max.overlaps = Inf, 
+    size = 3,
+    segment.size = 0.3,        # Add line thickness
+    segment.color = "grey50",  # Set line color
+    box.padding = 0.5,         # Add padding around text
+    point.padding = 0.3,       # Add padding around points
+    force = 5                  # Increase force of repulsion
+  ) +
+  scale_color_manual(values = c("Not Significant" = "grey", 
+                               "Upregulated" = "red", 
+                               "Downregulated" = "blue")) +
+  labs(#title = "Volcano Plot: Low vs Control",
+       x = "Log2 Fold Change", y = "-log10(P-value)") +
+  theme_minimal()
+
+ggsave("low_volcano_plot.tiff", width = 7, height = 5)
+
+```
+
+
+
+
+
+
+
+```{r}
+
+#heatmap for low and control group, use for article
+library(pheatmap)
+
+# STEP 1: Filter DEGs based on adjusted p-value and logFC
+deg_df <- results$LowVsControl
+significant_genes <- deg_df[
+    deg_df$adj.P.Val < 0.05 & abs(deg_df$logFC) > 1.5 & !is.na(deg_df$SYMBOL),
+]
+
+# Optional: remove duplicated gene symbols (keep first occurrence)
+#significant_genes <- significant_genes[!duplicated(significant_genes$SYMBOL), ]
+
+# Get probe IDs and gene symbols
+selected_probe_ids <- rownames(significant_genes)
+selected_gene_symbols <- significant_genes$SYMBOL
+names(selected_gene_symbols) <- selected_probe_ids
+
+# STEP 2: Subset expression matrix to selected genes and samples
+keep_samples <- sample_group_map$Sample[sample_group_map$Group %in% c("Low", "Control")]
+heat_data <- norm_expr[selected_probe_ids, keep_samples]
+
+# STEP 3: Set gene symbols as rownames
+rownames(heat_data) <- selected_gene_symbols[rownames(heat_data)]
+
+# STEP 4: Remove genes with NA expression values across selected samples
+heat_data <- heat_data[complete.cases(heat_data), ]
+
+# STEP 5: Create sample annotation for columns
+groups <- setNames(sample_group_map$Group, sample_group_map$Sample)
+annotation_col <- data.frame(Group = groups[keep_samples])
+rownames(annotation_col) <- keep_samples
+
+# STEP 6: Plot heatmap
+pheatmap(heat_data,
+         annotation_col = annotation_col,
+         scale = "row",               # Normalize each gene (row)
+         cluster_cols = TRUE,
+         cluster_rows = TRUE,
+         main = "DEGs (Low vs Control)",
+         fontsize_row = 8,
+         filename = "/home/rstudio/data/rat_treatment/heatmap_filtered_DEGs.tiff")
+
+
+```
+
+
+```{r}
+#heatmap including high group
+library(pheatmap)
+library(ggplot2)
+
+# STEP 1: Combine significant DEGs from both comparisons
+deg_low <- results$LowVsControl
+deg_high <- results$HighVsControl
+
+# Filter DEGs
+sig_low <- deg_low[
+    deg_low$adj.P.Val < 0.05 & abs(deg_low$logFC) > 1.5 & !is.na(deg_low$SYMBOL),
+]
+sig_high <- deg_high[
+    deg_high$adj.P.Val < 0.05 & abs(deg_high$logFC) > 1.5 & !is.na(deg_high$SYMBOL),
+]
+
+low_subset <- sig_low[, c("PROBEID", "SYMBOL")]
+high_subset <- sig_high[, c("PROBEID", "SYMBOL")]
+
+# Combine the two
+combined_degs <- rbind(low_subset, high_subset)
+
+# Remove duplicate rows (i.e., same PROBEID and SYMBOL)
+combined_degs <- combined_degs[!duplicated(combined_degs), ]
+
+# (Optional) Reset row names
+rownames(combined_degs) <- NULL
+
+# Get probe IDs and gene symbols
+selected_probe_ids <- combined_degs$PROBEID
+selected_gene_symbols <- combined_degs$SYMBOL
+names(selected_gene_symbols) <- selected_probe_ids
+
+# STEP 2: Include Low, High, and Control samples
+keep_samples <- sample_group_map$Sample[sample_group_map$Group %in% c("Low", "High", "Control")]
+heat_data <- norm_expr[selected_probe_ids, keep_samples]
+
+# STEP 3: Match and assign gene symbols to rows
+gene_symbols <- selected_gene_symbols[match(rownames(heat_data), names(selected_gene_symbols))]
+
+# Remove any rows with missing gene symbols
+valid_rows <- !is.na(gene_symbols)
+heat_data <- heat_data[valid_rows, ]
+gene_symbols <- gene_symbols[valid_rows]
+
+# Optionally make gene symbols unique if duplicated
+rownames(heat_data) <- make.unique(gene_symbols)
+
+# STEP 4: Remove genes with NA expression values across selected samples
+heat_data <- heat_data[complete.cases(heat_data), ]
+
+# STEP 5: Create sample annotation for columns
+groups <- setNames(sample_group_map$Group, sample_group_map$Sample)
+annotation_col <- data.frame(Group = groups[keep_samples])
+rownames(annotation_col) <- keep_samples
+
+# STEP 6: Plot heatmap
+pheatmap(heat_data,
+         annotation_col = annotation_col,
+         scale = "row",               # Normalize each gene (row)
+         cluster_cols = TRUE,
+         cluster_rows = TRUE,
+         main = "DEGs (Low & High vs Control)",
+         #height = max(8, 36 * 0.3),
+         fontsize_row = 8,
+         filename = "/home/rstudio/data/rat_treatment/heatmap_filtered_DEGs_all_groups.tiff")
+
+
+
+
+```
+
+
